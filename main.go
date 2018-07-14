@@ -4,9 +4,12 @@ import (
 	"fmt"
 	"log"
 	"net/http"
+	"time"
 
 	"github.com/gorilla/mux"
 )
+
+const timeout = 30 // Client-Server connection timeout
 
 var messageService *service
 var messages []message
@@ -43,6 +46,13 @@ func (b *service) post(msg message, topic string) {
 	}
 }
 
+func (b *service) timeoutTimer(ch chan message) {
+	time.Sleep(time.Second * timeout)
+	msg := message{event: "timeout", data: fmt.Sprintf("%ds", timeout)}
+	ch <- msg
+	b.drop(ch)
+}
+
 // PostMessage posts a message to the specified topic
 // Successful operation returns a response status code HTTP 204
 func PostMessage(w http.ResponseWriter, r *http.Request) {
@@ -77,14 +87,21 @@ func GetMessages(w http.ResponseWriter, r *http.Request) {
 	topic := params["topic"] // Get topic from URL parameter
 
 	ch := messageService.listen(topic)
+	go messageService.timeoutTimer(ch)
 	defer messageService.drop(ch)
 
-	for {
+	for _, active := messageService.clients[ch]; active; {
 		msg := <-ch
-		fmt.Fprintf(w, "id: %d\nevent: %s\ndata: %s\n\n", msg.id, msg.event, msg.data)
-		fmt.Printf("id: %d\nevent: %s\ndata: %s\n\n", msg.id, msg.event, msg.data)
+		if msg.id != 0 {
+			fmt.Fprintf(w, "id: %d\nevent: %s\ndata: %s\n\n", msg.id, msg.event, msg.data)
+		} else {
+			fmt.Fprintf(w, "event: %s\ndata: %s\n\n", msg.event, msg.data)
+		}
 		f.Flush()
+		_, active = messageService.clients[ch] // Check if connection still active
 	}
+
+	r.Body.Close()
 }
 
 func main() {
