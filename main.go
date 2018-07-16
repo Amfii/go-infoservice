@@ -4,6 +4,8 @@ import (
 	"fmt"
 	"log"
 	"net/http"
+	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/gorilla/mux"
@@ -12,35 +14,53 @@ import (
 const timeout = 30 // Client-Server connection timeout
 
 var messageService *service
-var messages []message
+var messages int64
 
 type message struct {
-	id    int
+	id    int64
 	event string
 	data  string
 }
 
 type service struct {
+	sync.RWMutex
 	clients map[chan message]string
 }
 
 func newService() *service {
-	return &service{make(map[chan message]string)}
+	return &service{clients: make(map[chan message]string)}
 }
 
 func (b *service) listen(topic string) chan message {
 	ch := make(chan message)
+
+	b.Lock()
+	defer b.Unlock()
 	b.clients[ch] = topic
+
 	return ch
 }
 
 func (b *service) drop(ch chan message) {
-	delete(b.clients, ch)
+	b.RLock()
+	_, active := b.clients[ch]
+	b.RUnlock()
+	if active { // Drop connection if still active
+		b.Lock()
+
+		delete(b.clients, ch)
+		close(ch)
+
+		b.Unlock()
+	}
 }
 
 func (b *service) post(msg message, topic string) {
+	b.RLock()
+	defer b.RUnlock()
+
 	for ch, room := range b.clients {
-		if room == topic {
+		if _, active := b.clients[ch]; room == topic && active {
 			ch <- msg
 		}
 	}
@@ -48,9 +68,15 @@ func (b *service) post(msg message, topic string) {
 
 func (b *service) timeoutTimer(ch chan message) {
 	time.Sleep(time.Second * timeout)
-	msg := message{event: "timeout", data: fmt.Sprintf("%ds", timeout)}
-	ch <- msg
-	b.drop(ch)
+
+	b.RLock()
+	_, active := b.clients[ch]
+	b.RUnlock()
+	if active { // Timeout connection if still active
+		msg := message{event: "timeout", data: fmt.Sprintf("%ds", timeout)}
+		ch <- msg
+		b.drop(ch)
+	}
 }
 
 // PostMessage posts a message to the specified topic
@@ -62,11 +88,12 @@ func PostMessage(w http.ResponseWriter, r *http.Request) {
 	r.ParseForm()
 
 	for key := range r.PostForm {
-		msg := message{len(messages) + 1, "msg", key}
-		messages = append(messages, msg)
+		atomic.StoreInt64(&messages, atomic.LoadInt64(&messages)+1)
+		msg := message{atomic.LoadInt64(&messages), "msg", key}
 		messageService.post(msg, topic)
 	}
 
+	w.Header().Add("Access-Control-Allow-Origin", "*")
 	w.WriteHeader(http.StatusNoContent) // HTTP 204
 }
 
@@ -82,6 +109,7 @@ func GetMessages(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "text/event-stream")
 	w.Header().Set("Cache-Control", "no-cache")
 	w.Header().Set("Connection", "keep-alive")
+	w.Header().Add("Access-Control-Allow-Origin", "*")
 
 	params := mux.Vars(r)    // Get request parameters
 	topic := params["topic"] // Get topic from URL parameter
@@ -90,15 +118,15 @@ func GetMessages(w http.ResponseWriter, r *http.Request) {
 	go messageService.timeoutTimer(ch)
 	defer messageService.drop(ch)
 
-	for _, active := messageService.clients[ch]; active; {
-		msg := <-ch
+	for msg, active := <-ch; active; {
 		if msg.id != 0 {
 			fmt.Fprintf(w, "id: %d\nevent: %s\ndata: %s\n\n", msg.id, msg.event, msg.data)
 		} else {
 			fmt.Fprintf(w, "event: %s\ndata: %s\n\n", msg.event, msg.data)
 		}
 		f.Flush()
-		_, active = messageService.clients[ch] // Check if connection still active
+
+		msg, active = <-ch
 	}
 
 	r.Body.Close()
