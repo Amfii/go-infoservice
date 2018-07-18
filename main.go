@@ -4,8 +4,6 @@ import (
 	"fmt"
 	"log"
 	"net/http"
-	"sync"
-	"sync/atomic"
 	"time"
 
 	"github.com/gorilla/mux"
@@ -13,17 +11,34 @@ import (
 
 const timeout = 30 // Client-Server connection timeout
 
-var messageService *service
-var messages int64
+var posts = make(chan *postOp)
+var creates = make(chan *createOp)
+var timeouts = make(chan *timeoutOp)
+
+type postOp struct {
+	topic   string
+	message string
+	resp    chan bool
+}
+
+type createOp struct {
+	key  chan message
+	val  string
+	resp chan bool
+}
+
+type timeoutOp struct {
+	key  chan message
+	resp chan bool
+}
 
 type message struct {
-	id    int64
+	id    int
 	event string
 	data  string
 }
 
 type service struct {
-	sync.RWMutex
 	clients map[chan message]string
 }
 
@@ -31,52 +46,12 @@ func newService() *service {
 	return &service{clients: make(map[chan message]string)}
 }
 
-func (b *service) listen(topic string) chan message {
-	ch := make(chan message)
-
-	b.Lock()
-	defer b.Unlock()
-	b.clients[ch] = topic
-
-	return ch
-}
-
-func (b *service) drop(ch chan message) {
-	b.RLock()
-	_, active := b.clients[ch]
-	b.RUnlock()
-	if active { // Drop connection if still active
-		b.Lock()
-
-		delete(b.clients, ch)
-		close(ch)
-
-		b.Unlock()
-	}
-}
-
-func (b *service) post(msg message, topic string) {
-	b.RLock()
-	defer b.RUnlock()
-
-	for ch, room := range b.clients {
-		if _, active := b.clients[ch]; room == topic && active {
-			ch <- msg
-		}
-	}
-}
-
-func (b *service) timeoutTimer(ch chan message) {
+func timeoutTimer(ch chan message) {
 	time.Sleep(time.Second * timeout)
 
-	b.RLock()
-	_, active := b.clients[ch]
-	b.RUnlock()
-	if active { // Timeout connection if still active
-		msg := message{event: "timeout", data: fmt.Sprintf("%ds", timeout)}
-		ch <- msg
-		b.drop(ch)
-	}
+	drop := &timeoutOp{ch, make(chan bool)}
+	timeouts <- drop
+	<-drop.resp
 }
 
 // PostMessage posts a message to the specified topic
@@ -88,9 +63,9 @@ func PostMessage(w http.ResponseWriter, r *http.Request) {
 	r.ParseForm()
 
 	for key := range r.PostForm {
-		atomic.StoreInt64(&messages, atomic.LoadInt64(&messages)+1)
-		msg := message{atomic.LoadInt64(&messages), "msg", key}
-		messageService.post(msg, topic)
+		post := &postOp{topic, key, make(chan bool)}
+		posts <- post
+		<-post.resp
 	}
 
 	w.Header().Add("Access-Control-Allow-Origin", "*")
@@ -114,9 +89,14 @@ func GetMessages(w http.ResponseWriter, r *http.Request) {
 	params := mux.Vars(r)    // Get request parameters
 	topic := params["topic"] // Get topic from URL parameter
 
-	ch := messageService.listen(topic)
-	go messageService.timeoutTimer(ch)
-	defer messageService.drop(ch)
+	// Add new client
+	ch := make(chan message)
+	create := &createOp{ch, topic, make(chan bool)}
+	creates <- create
+	<-create.resp
+
+	// Start client timeout timer
+	go timeoutTimer(ch)
 
 	for msg, active := <-ch; active; {
 		if msg.id != 0 {
@@ -133,7 +113,30 @@ func GetMessages(w http.ResponseWriter, r *http.Request) {
 }
 
 func main() {
-	messageService = newService()
+	go func() {
+		messages := 0
+		messageService := newService()
+		for {
+			select {
+			case drop := <-timeouts:
+				drop.key <- message{event: "timeout", data: fmt.Sprintf("%ds", timeout)}
+				delete(messageService.clients, drop.key)
+				close(drop.key)
+				drop.resp <- true
+			case post := <-posts:
+				messages++
+				for ch, room := range messageService.clients {
+					if room == post.topic {
+						ch <- message{messages, "msg", post.message}
+					}
+				}
+				post.resp <- true
+			case create := <-creates:
+				messageService.clients[create.key] = create.val
+				create.resp <- true
+			}
+		}
+	}()
 
 	router := mux.NewRouter()
 	router.HandleFunc("/infocenter/{topic}", PostMessage).Methods("POST")
